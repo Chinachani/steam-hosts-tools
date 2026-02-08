@@ -49,13 +49,48 @@ def resolve_with_nslookup(domain: str, dns: str) -> list[str]:
     except Exception:
         return []
     ips = []
+    skip_ips = {dns}
     for line in out.splitlines():
-        line = line.strip()
-        if line.lower().startswith("address:"):
-            ip = line.split(":", 1)[1].strip()
-            if ip and ":" not in ip:
-                ips.append(ip)
-    return ips
+        raw = line.strip()
+        if not raw:
+            continue
+        # Skip DNS server lines (English/Chinese)
+        if raw.lower().startswith(("server:", "服务器:")):
+            continue
+        # Extract IPv4 addresses from line
+        for token in raw.replace(",", " ").split():
+            if token.count(".") != 3:
+                continue
+            if any(ch for ch in token if not (ch.isdigit() or ch == ".")):
+                continue
+            if token in skip_ips:
+                continue
+            ips.append(token)
+    return sorted(set(ips))
+
+
+def resolve_with_powershell(domain: str, dns: str) -> list[str]:
+    if platform.system().lower() != "windows":
+        return []
+    if not has_cmd("powershell"):
+        return []
+    try:
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            f"Resolve-DnsName -Name {domain} -Server {dns} -Type A | "
+            "Select-Object -ExpandProperty IPAddress",
+        ]
+        out = subprocess.check_output(cmd, text=True, timeout=8)
+    except Exception:
+        return []
+    ips = []
+    for line in out.splitlines():
+        ip = line.strip()
+        if ip and ":" not in ip:
+            ips.append(ip)
+    return sorted(set(ips))
 
 
 def resolve_system(domain: str) -> list[str]:
@@ -71,15 +106,27 @@ def resolve_system(domain: str) -> list[str]:
         return []
 
 
-def resolve_domain(domain: str, dns_servers: list[str]) -> list[str]:
+def resolve_domain(domain: str, dns_servers: list[str], verbose: bool = False) -> list[str]:
     for dns in dns_servers:
         ips = resolve_with_dig(domain, dns)
-        if not ips:
-            ips = resolve_with_nslookup(domain, dns)
         if ips:
+            if verbose:
+                print(f"[DEBUG] {domain} -> {', '.join(ips)} via dig @{dns}")
+            return sorted(set(ips))
+        ips = resolve_with_nslookup(domain, dns)
+        if ips:
+            if verbose:
+                print(f"[DEBUG] {domain} -> {', '.join(ips)} via nslookup {dns}")
+            return sorted(set(ips))
+        ips = resolve_with_powershell(domain, dns)
+        if ips:
+            if verbose:
+                print(f"[DEBUG] {domain} -> {', '.join(ips)} via Resolve-DnsName {dns}")
             return sorted(set(ips))
     # Fallback to system resolver
     ips = resolve_system(domain)
+    if ips and verbose:
+        print(f"[DEBUG] {domain} -> {', '.join(ips)} via system resolver")
     return sorted(set(ips))
 
 
@@ -94,6 +141,7 @@ def main() -> int:
         help="Comma-separated DNS servers for resolution (uses dig/nslookup if available).",
     )
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--verbose", action="store_true", help="Show resolver details for each domain.")
     args = parser.parse_args()
 
     hosts_path = Path(args.hosts_path)
@@ -128,7 +176,7 @@ def main() -> int:
 
     new_entries = []
     for domain in STEAM_DOMAINS:
-        ips = resolve_domain(domain, dns_servers)
+        ips = resolve_domain(domain, dns_servers, verbose=args.verbose)
         if not ips:
             print(f"[WARN] failed to resolve {domain} via DNS {', '.join(dns_servers)}")
             continue
@@ -144,6 +192,10 @@ def main() -> int:
         for line in new_entries:
             print(line)
         return 0
+
+    if not new_entries:
+        print("[ERROR] no DNS results, hosts not modified. Please check DNS/connection.")
+        return 2
 
     hosts_path.write_text("\n".join(final_lines) + "\n", encoding="utf-8")
     print(f"[INFO] hosts updated: {hosts_path}")
