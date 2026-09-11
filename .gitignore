@@ -1,0 +1,5 @@
+hosts_backup/
+*.bak
+__pycache__/
+*.py[cod]
+.DS_Store
