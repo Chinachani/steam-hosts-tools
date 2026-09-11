@@ -16,6 +16,10 @@ import sys
 import time
 from pathlib import Path
 
+# 强制清除所有环境变量代理，确保直连检测连通性与延迟
+for _k in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
+    os.environ.pop(_k, None)
+
 STEAM_DOMAINS = [
     "store.steampowered.com",
     "login.steampowered.com",

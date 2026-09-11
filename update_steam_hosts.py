@@ -57,6 +57,11 @@ DOH_ENDPOINTS = [
     ("Google", "https://dns.google/resolve?name={domain}&type=A"),
 ]
 
+# 强制清除所有环境变量代理，确保 DoH 解析与 TCP 测速 100% 直连，不被任何本地 Clash/代理劫持
+for _k in ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]:
+    os.environ.pop(_k, None)
+urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+
 # 备用优质 CDN IP 池（当本地所有 DNS 均不可用时的兜底节点）
 FALLBACK_IPS = {
     "store.steampowered.com": ["23.15.142.182", "23.49.104.48", "104.89.103.51"],
@@ -67,14 +72,45 @@ FALLBACK_IPS = {
 }
 
 
-def is_admin() -> bool:
-    """检查当前进程是否具有管理员 / root 权限"""
+def is_admin(hosts_path: Path | None = None) -> bool:
+    """检查当前进程是否具有管理员 / root 权限，或目标 hosts 文件直接具备写入权限，或可通过 Docker 提权"""
     try:
         if platform.system().lower() == "windows":
             return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        return os.geteuid() == 0
+        if os.geteuid() == 0:
+            return True
+        if hosts_path and hosts_path.exists() and os.access(hosts_path, os.W_OK):
+            return True
+        if shutil.which("docker") and platform.system().lower() == "linux":
+            check = subprocess.run(["docker", "ps"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if check.returncode == 0:
+                return True
+        return False
     except Exception:
         return False
+
+
+def write_hosts_file(hosts_path: Path, content: str) -> None:
+    """安全写入 hosts 文件，若无直接写权限则尝试通过 Docker 提权写入"""
+    try:
+        hosts_path.write_text(content, encoding="utf-8")
+    except PermissionError:
+        if shutil.which("docker") and platform.system().lower() == "linux":
+            temp_file = Path("/tmp/steam_hosts_update.tmp")
+            temp_file.write_text(content, encoding="utf-8")
+            res = subprocess.run(
+                [
+                    "docker", "run", "--rm",
+                    "-v", f"{hosts_path.resolve()}:/target_hosts",
+                    "-v", f"{temp_file.resolve()}:/new_hosts",
+                    "alpine", "sh", "-c", "cat /new_hosts > /target_hosts",
+                ],
+                capture_output=True, text=True,
+            )
+            temp_file.unlink(missing_ok=True)
+            if res.returncode == 0:
+                return
+        raise
 
 
 def get_default_hosts_path() -> Path:
@@ -316,7 +352,7 @@ def main() -> int:
     print("=" * 66)
 
     # 1. 检查权限
-    if not args.dry_run and not is_admin():
+    if not args.dry_run and not is_admin(hosts_path):
         print("[ERROR] 权限不足！修改 hosts 文件需要管理员权限 (Administrator / root)。", file=sys.stderr)
         if platform.system().lower() == "windows":
             print("[提示] 请右键以「管理员身份运行」打开 PowerShell / CMD 后重试。", file=sys.stderr)
@@ -350,7 +386,7 @@ def main() -> int:
 
         newline = "\r\n" if platform.system().lower() == "windows" else "\n"
         final_text = newline.join(cleaned_lines) + newline
-        hosts_path.write_text(final_text, encoding="utf-8")
+        write_hosts_file(hosts_path, final_text)
         print(f"[SUCCESS] 成功移除 {removed} 条 Steam hosts 记录！")
         if not args.no_flush:
             flush_dns_cache()
@@ -432,7 +468,7 @@ def main() -> int:
     final_content = newline.join(final_lines)
 
     try:
-        hosts_path.write_text(final_content, encoding="utf-8")
+        write_hosts_file(hosts_path, final_content)
         print(f"[3/3] hosts 写入完成: {hosts_path}")
     except Exception as e:
         print(f"[ERROR] 写入 hosts 文件失败: {e}", file=sys.stderr)
